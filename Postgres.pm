@@ -7,7 +7,7 @@
 # redistribute it and/or modify it under the same terms as Perl
 # itself.
 #
-# $Id: Postgres.pm,v 1.17 2000/09/27 02:06:08 cvs Exp $
+# $Id: Postgres.pm,v 1.22 2000/10/01 03:38:27 cvs Exp $
 
 package Persistence::Object::Postgres;
 
@@ -16,7 +16,7 @@ use Carp;
 use Data::Dumper;
 use vars qw( $VERSION );
 
-( $VERSION ) = '$Revision: 1.17 $' =~ /\s+([\d\.]+)/;
+( $VERSION ) = '$Revision: 1.22 $' =~ /\s+([\d\.]+)/;
 
 sub dbconnect {
   my ($class, $dbobj) = @_;
@@ -65,24 +65,12 @@ sub values {
   return undef unless my $n = $s->rows(); map { $s->fetchrow_array() } (1..$n);
 }
 
-sub dumper {
-  my $self = shift; 
-  $self->{__Dumper} = new Data::Dumper ([$self]); 
-  return $self->{__Dumper}; 
-}
-
 sub commit {
   my ($self, %args) = @_; return undef unless ref $self;
   return undef unless my $dope = $self->{__Dope}; 
   return undef unless my $table = $dope->{Table};
-  my $r; my %tablecols; my $query; my $oid = $self->{__Oid} || 0; 
-  my $d = $self->{__Dumper} || $self->dumper (); my @tablecols = ();
-  for ( keys %$self ) { delete $self->{ $_ } if /^__(?:Dumper|Dope|Oid)/ }; 
-
-  my %dd = %$self;
-  my $dumper = defined &Data::Dumper::Dumpxs?$d->Dumpxs():$d->Dump(); 
-  $dumper =~ s/(?<=[^\\])\'/\\\'/sg; my @dump = map { "$_\n" } split ( /\n/, $dumper);
-  my $indent = $dump[1]; $indent =~ s/\S.*\n//; $indent = (length $indent)+2;
+  my $r; my %tablecols; my @tablecols = (); my $query; my $oid = $self->{__Oid} || 0; 
+  for ( keys %$self ) { delete $self->{ $_ } if /^__(?:Dope|Oid)/ }; 
 
   $s = $dope->{__DBHandle}->prepare("select * from $table where oid=$oid");
   $s->execute(); my @fields = @{$s->{NAME}};
@@ -91,7 +79,8 @@ sub commit {
       ("alter table $table add column __dump text");
     $s->execute(); return undef unless $s->rows();
   }
-    
+  
+  my %dd = %$self; $Data::Dumper::Indent = 0; 
   foreach $key (keys %{$dope->{Template}}) {
     unless (grep { $_ eq $dope->{Template}->{$key} } @fields) {
       if ($dope->{Createfields}) {
@@ -103,17 +92,20 @@ sub commit {
 	next;
       }
     }
-    my $i = 0; my $indent2 = (length $key)+$indent+4;
-    my $stringified = join '', grep { $i=0 if /^.{$indent}(?!$key)\S/;
-                                      $i=1 if /^.{$indent}$key/; $i;
-                                    } @dump;
-    $stringified =~ s/^(.\s+)\\\'$key\\\'/$1\'$key\'/s; 
-    $stringified =~ s/^.{$indent2}//mg; $stringified=~s/,?\n?$//s;
-    $stringified =~ s/^(\\\')?/\'/s; $stringified =~ s/(\\\')?$/\'/s; 
+    my $stringified = '';
+    if (defined $self->{$key}) {
+      $stringified = defined &Data::Dumper::Dumpxs?
+	Data::Dumper::DumperX($self->{$key}):
+	  Data::Dumper::Dumper($self->{$key});
+      $stringified =~ s/^\$VAR1 = (.*);$/$1/s;
+      $stringified =~ s/(?<=[^\\])\'/\\\'/sg; $stringified =~ s/^'/\\'/s;
+      $stringified =~ s/^(\\\')?/\'/s; $stringified =~ s/(\\\')?$/\'/s; 
+    }
     $tablecols{$dope->{Template}->{$key}} = $stringified;
     if (ref $dd{$key}) { $dd{$key} = 'ref' } else { delete $dd{$key} };
   }
 
+  $Data::Dumper::Indent = 1;
   my $dd = bless \%dd, ref $self; $d = new Data::Dumper ([$dd]); 
   $dumper = defined &Data::Dumper::Dumpxs?$d->Dumpxs():$d->Dump(); 
   $dumper =~ s/\'/\\\'/sg; $dumper = "'$dumper'"; 
@@ -135,9 +127,9 @@ sub commit {
     $query = "insert into $table values (" . join (',',@insert) . ')';
   }
   
-  $query =~ s/(?<=[,(]),/'',/sg; $query =~ s/,(?=\))/,''/sg;
-  $query =~ s/''/NULL/g;
-  $s = $dope->{__DBHandle}->prepare($query); print "$query\n";
+  $query =~ s/(?<=[=,(]),/'',/sg; $query =~ s/,(?=\))/,''/sg;
+  $query =~ s/''/NULL/sg;
+  $s = $dope->{__DBHandle}->prepare($query);
   $s->execute(); return undef unless $s->rows();
   $self->{__Dope} = $dope; 
   $self->{__Oid} = $oid || $s->{pg_oid_status};
@@ -265,18 +257,6 @@ commit() to store it in a different table or database.
   $object->commit;
   $db->table('active');
   $object->expire(); 
-
-=item B<dumper()> 
-
-Returns the Data::Dumper instance bound to the object.  Should be
-called before commit() to change Data::Dumper behavior.
-
-  my $dd = $object->dumper(); 
-  $dd->purity(1); 
-  $dd->terse(1);    # Smaller dumps. 
-  $object->commit(); 
-
-=back
 
 =head1 Inheriting Persistence::Object::Postgres
 

@@ -7,7 +7,7 @@
 # redistribute it and/or modify it under the same terms as Perl
 # itself.
 #
-# $Id: Postgres.pm,v 1.5 2000/07/28 09:50:48 cvs Exp $
+# $Id: Postgres.pm,v 1.8 2000/07/30 01:27:56 cvs Exp $
 
 package Persistence::Object::Postgres;
 
@@ -16,7 +16,7 @@ use Carp;
 use Data::Dumper;
 use vars qw( $VERSION );
 
-( $VERSION ) = '$Revision: 1.5 $' =~ /\s+([\d\.]+)/;
+( $VERSION ) = '$Revision: 1.8 $' =~ /\s+([\d\.]+)/;
 
 sub dbconnect {
   my ($class, $dbobj) = @_;
@@ -39,7 +39,7 @@ sub new {
   $self = $class->load (__Dope => $dope, __Oid => $oid )
     if my $oid = $args{__Oid};
   $self->{__Oid} = $oid if $self; $self = {} unless $self; 
-  $self->{__Dope} = $dope;
+  $self->{__Dope} = $dope; 
   bless $self, $class;
 }
 
@@ -58,15 +58,9 @@ sub values {
   return undef unless my $key = $args{Key} and my $dope = $args{__Dope};
   return undef unless my $table = $dope->{Table} and my $field = $dope->{Template}->{$key};
   my $r = $dope->{__DBHandle}->exec("select * from $table where oid=0");
-  return undef unless grep { $field eq $_ } map { $r->fname($_) } (0..$r->nfields()-1);
+  return undef unless grep { $_ eq $field } map { $r->fname($_) } (0..$r->nfields()-1);
   $r = $dope->{__DBHandle}->exec("select oid,$field from $table");
   map { $r->fetchrow() } (1..$r->ntuples());
-}
-
-sub dope {
-  my ($self, $dope) = @_;
-  ${ $self->{ __Dope } } = $dope if $dope;
-  ${ $self->{ __Dope } };
 }
 
 sub dumper {
@@ -80,7 +74,7 @@ sub commit {
   return undef unless my $dope = $self->{__Dope}; 
   return undef unless my $table = $dope->{Table};
   my $r; my %tablecols; my $query; my $oid = $self->{__Oid} || 0; 
-  my $d = $self->{__Dumper} || $self->dumper ();
+  my $d = $self->{__Dumper} || $self->dumper (); my @tablecols = ();
   for ( keys %$self ) { delete $self->{ $_ } if /^__(?:Dumper|Dope|Oid)/ }; 
 
   my $dumper = defined &Data::Dumper::Dumpxs?$d->Dumpxs():$d->Dump(); 
@@ -88,18 +82,39 @@ sub commit {
   $dumper = "'$dumper'"; my $indent = $dump[1]; 
   $indent =~ s/\S.*\n//; $indent = (length $indent)+2;
 
-  foreach $field (keys %{$dope->{Template}}) {
-    my $i = 0; my $indent2 = (length $field)+$indent+4;
-    my $stringified = join '', grep { $i=0 if /^.{$indent}(?!$field)\S/;
-                                      $i=1 if /^.{$indent}$field/; $i;
+  $r = $dope->{__DBHandle}->exec("select * from $table where oid=$oid");
+  my @fields = map { $r->fname($_) } (0..$r->nfields()-1);
+
+  unless (grep { $_ eq '__dump' } @fields) {
+    my $s = $dope->{__DBHandle}->exec
+      ("alter table $table add column __dump text");
+    return undef unless $s->resultStatus == PGRES_COMMAND_OK;
+  }
+    
+  foreach $key (keys %{$dope->{Template}}) {
+    unless (grep { $_ eq $dope->{Template}->{$key} } @fields) {
+      if ($dope->{Createfields}) {
+	my $s = $dope->{__DBHandle}->exec
+	  ("alter table $table add column $dope->{Template}->{$key} text");
+	return undef unless $s->resultStatus == PGRES_COMMAND_OK;
+      }
+      else {
+	next;
+      }
+    }
+    my $i = 0; my $indent2 = (length $key)+$indent+4;
+    my $stringified = join '', grep { $i=0 if /^.{$indent}(?!$key)\S/;
+                                      $i=1 if /^.{$indent}$key/; $i;
                                     } @dump;
-    $stringified =~ s/^(.\s+)\\\'$field\\\'/$1\'$field\'/s; 
+    $stringified =~ s/^(.\s+)\\\'$key\\\'/$1\'$key\'/s; 
     $stringified =~ s/^.{$indent2}//mg; $stringified=~s/,?\n?$//s;
     $stringified =~ s/^(\\\')?/\'/s; $stringified =~ s/(\\\')?$/\'/s; 
-    $tablecols{$dope->{Template}->{$field}} .= $stringified;
+    $tablecols{$dope->{Template}->{$key}} = $stringified;
   }
 
   $r = $dope->{__DBHandle}->exec("select * from $table where oid=$oid");
+  @fields = map { $r->fname($_) } (0..$r->nfields()-1);
+  
   if ($r->ntuples and $oid!=0) {
     $query = "update $table set " . 
              join (',', (map { "$_=$tablecols{$_}" } keys %tablecols),
@@ -107,15 +122,16 @@ sub commit {
   }
   else {
     my @insert = ();
-    for (0..$r->nfields()-1) {
-      my $field = $r->fname($_);
-      push (@insert, $dumper), next if $field eq '__dump';
-      push @insert, $tablecols{$field};
+    for (@fields) {
+      push (@insert, $dumper), next if $_ eq '__dump';
+      push @insert, $tablecols{$_};
     }
     $query = "insert into $table values (" . join (',',@insert) . ')';
   }
 
+  $query =~ s/(?<=[,(]),/'',/sg; $query =~ s/,(?=\))/,''/sg;
   $r = $dope->{__DBHandle}->exec($query);
+  return undef unless $r->resultStatus == PGRES_COMMAND_OK;
   $self->{__Dope} = $dope; 
   $self->{__Oid} = $oid || $r->oidStatus;
 }
@@ -128,6 +144,18 @@ sub expire {
   return undef unless $r->ntuples();
   $dope->{__DBHandle}->exec("delete from $table where oid=$oid");
 } 
+
+sub AUTOLOAD {
+  my ($self, $val) = @_; (my $auto = $AUTOLOAD) =~ s/.*:://;
+  if ($auto =~ /^(dope|oid)$/) {
+    $self->{"__\u$auto"} = $val if defined $val;
+    return $self->{"__\u$auto"};
+  }
+  else {
+    croak "Could not AUTOLOAD method $auto.";
+  }
+}
+
 
 'True Value';
 

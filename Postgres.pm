@@ -7,7 +7,7 @@
 # redistribute it and/or modify it under the same terms as Perl
 # itself.
 #
-# $Id: Postgres.pm,v 1.9 2000/08/30 09:44:22 cvs Exp $
+# $Id: Postgres.pm,v 1.17 2000/09/27 02:06:08 cvs Exp $
 
 package Persistence::Object::Postgres;
 
@@ -16,7 +16,7 @@ use Carp;
 use Data::Dumper;
 use vars qw( $VERSION );
 
-( $VERSION ) = '$Revision: 1.9 $' =~ /\s+([\d\.]+)/;
+( $VERSION ) = '$Revision: 1.17 $' =~ /\s+([\d\.]+)/;
 
 sub dbconnect {
   my ($class, $dbobj) = @_;
@@ -33,7 +33,7 @@ sub dbconnect {
 sub new {
   my ($class, %args) = @_; my $self=undef;
   return undef unless my $dope = $args{__Dope};
-  $self = $class->load (__Dope => $dope, __Oid => $oid )
+  $self = $class->load (__Dope => $dope, __Oid => $args{__Oid} )
     if my $oid = $args{__Oid};
   $self->{__Oid} = $oid if $self; $self = {} unless $self; 
   $self->{__Dope} = $dope; 
@@ -45,10 +45,13 @@ sub new {
 sub load { 
   my ( $class, %args ) = @_; 
   return undef unless my $oid = $args{__Oid} and my $dope = $args{__Dope}; 
-  return undef unless my $table = $dope->{Table};
-  my $s = $dope->{__DBHandle}->prepare("select __dump from $table where oid=$oid");
-  $s->execute(); return undef unless $s->rows(); my ($object) = $s->fetchrow_array();
-  $object = eval $object; $object->{__Dope} = $dope; $object->{__Oid} = $oid;
+  return undef unless my $table = $dope->{Table}; 
+  my @keys = keys %{$dope->{Template}};
+  my $selfields = join ',', '__dump', map { $dope->{Template}->{$_} } @keys;
+  my $s = $dope->{__DBHandle}->prepare("select $selfields from $table where oid=$oid");
+  $s->execute(); return undef unless $s->rows(); my @row = $s->fetchrow_array();
+  $object = eval $row[0]; $object->{__Dope} = $dope; $object->{__Oid} = $oid;
+  my $i = 0; foreach (@keys) { $object->{$_} = $object->{$_} eq 'ref'?eval $row[++$i]:$row[++$i] }
   return $object; 
 }
 
@@ -76,10 +79,10 @@ sub commit {
   my $d = $self->{__Dumper} || $self->dumper (); my @tablecols = ();
   for ( keys %$self ) { delete $self->{ $_ } if /^__(?:Dumper|Dope|Oid)/ }; 
 
+  my %dd = %$self;
   my $dumper = defined &Data::Dumper::Dumpxs?$d->Dumpxs():$d->Dump(); 
-  $dumper =~ s/\'/\\\'/sg; my @dump = map { "$_\n" } split ( /\n/, $dumper);
-  $dumper = "'$dumper'"; my $indent = $dump[1]; 
-  $indent =~ s/\S.*\n//; $indent = (length $indent)+2;
+  $dumper =~ s/(?<=[^\\])\'/\\\'/sg; my @dump = map { "$_\n" } split ( /\n/, $dumper);
+  my $indent = $dump[1]; $indent =~ s/\S.*\n//; $indent = (length $indent)+2;
 
   $s = $dope->{__DBHandle}->prepare("select * from $table where oid=$oid");
   $s->execute(); my @fields = @{$s->{NAME}};
@@ -108,10 +111,15 @@ sub commit {
     $stringified =~ s/^.{$indent2}//mg; $stringified=~s/,?\n?$//s;
     $stringified =~ s/^(\\\')?/\'/s; $stringified =~ s/(\\\')?$/\'/s; 
     $tablecols{$dope->{Template}->{$key}} = $stringified;
+    if (ref $dd{$key}) { $dd{$key} = 'ref' } else { delete $dd{$key} };
   }
 
+  my $dd = bless \%dd, ref $self; $d = new Data::Dumper ([$dd]); 
+  $dumper = defined &Data::Dumper::Dumpxs?$d->Dumpxs():$d->Dump(); 
+  $dumper =~ s/\'/\\\'/sg; $dumper = "'$dumper'"; 
+
   $s = $dope->{__DBHandle}->prepare("select * from $table where oid=$oid");
-  $s->execute(); my @fields = @{$s->{NAME}};
+  my $n = $s->execute(); my @fields = @{$s->{NAME}};
   
   if ($n and $oid!=0) {
     $query = "update $table set " . 
@@ -128,7 +136,8 @@ sub commit {
   }
   
   $query =~ s/(?<=[,(]),/'',/sg; $query =~ s/,(?=\))/,''/sg;
-  $s = $dope->{__DBHandle}->prepare($query);
+  $query =~ s/''/NULL/g;
+  $s = $dope->{__DBHandle}->prepare($query); print "$query\n";
   $s->execute(); return undef unless $s->rows();
   $self->{__Dope} = $dope; 
   $self->{__Oid} = $oid || $s->{pg_oid_status};
@@ -180,7 +189,7 @@ Persistence::Object::Postgres - Object Persistence with PostgreSQL.
 
   my $object2 = new Persistence::Object::Postgres
     ( __Dope => $db, 
-      Oid => $object_id );
+      __Oid => $object_id );
 
   $object1->{$key} = $object2->{$key};
 

@@ -7,30 +7,27 @@
 # redistribute it and/or modify it under the same terms as Perl
 # itself.
 #
-# $Id: Postgres.pm,v 1.8 2000/07/30 01:27:56 cvs Exp $
+# $Id: Postgres.pm,v 1.9 2000/08/30 09:44:22 cvs Exp $
 
 package Persistence::Object::Postgres;
 
-use Pg;
+use DBI;
 use Carp;
 use Data::Dumper;
 use vars qw( $VERSION );
 
-( $VERSION ) = '$Revision: 1.8 $' =~ /\s+([\d\.]+)/;
+( $VERSION ) = '$Revision: 1.9 $' =~ /\s+([\d\.]+)/;
 
 sub dbconnect {
   my ($class, $dbobj) = @_;
   my %options = (host     => $dbobj->{Host} || '',
 		 port     => $dbobj->{Port} || '5432',
-		 user     => $dbobj->{Host} || (''.getpwuid $<),
-		 password => $dbobj->{Host} || ''
 		);
-  my $options = join (' ',"dbname=$dbobj->{Database}",
+  my $username = $dbobj->{Host} || (''.getpwuid $<);
+  my $password = $dbobj->{Host} || '';
+  my $options = join (';',"dbname=$dbobj->{Database}",
 		      grep { /=.+$/ } map { "$_=$options{$_}" } keys %options);
-  my $dbconn = Pg::connectdb ($options);
-  my $status = $dbconn->status;
-  return undef unless $status eq PGRES_CONNECTION_OK;
-  return $dbconn;
+  return undef unless $dbh = DBI->connect("dbi:Pg:$options", $username, $password);
 } 
 
 sub new {
@@ -40,6 +37,8 @@ sub new {
     if my $oid = $args{__Oid};
   $self->{__Oid} = $oid if $self; $self = {} unless $self; 
   $self->{__Dope} = $dope; 
+  delete $args{__Dope}; delete $args{__Oid};
+  foreach (keys %args) { $self->{$_} = $args{$_} }
   bless $self, $class;
 }
 
@@ -47,8 +46,8 @@ sub load {
   my ( $class, %args ) = @_; 
   return undef unless my $oid = $args{__Oid} and my $dope = $args{__Dope}; 
   return undef unless my $table = $dope->{Table};
-  my $r = $dope->{__DBHandle}->exec("select __dump from $table where oid=$oid");
-  return undef unless $r->ntuples(); my ($object) = $r->fetchrow();
+  my $s = $dope->{__DBHandle}->prepare("select __dump from $table where oid=$oid");
+  $s->execute(); return undef unless $s->rows(); my ($object) = $s->fetchrow_array();
   $object = eval $object; $object->{__Dope} = $dope; $object->{__Oid} = $oid;
   return $object; 
 }
@@ -57,10 +56,10 @@ sub values {
   my ($class, %args) = @_;
   return undef unless my $key = $args{Key} and my $dope = $args{__Dope};
   return undef unless my $table = $dope->{Table} and my $field = $dope->{Template}->{$key};
-  my $r = $dope->{__DBHandle}->exec("select * from $table where oid=0");
-  return undef unless grep { $_ eq $field } map { $r->fname($_) } (0..$r->nfields()-1);
-  $r = $dope->{__DBHandle}->exec("select oid,$field from $table");
-  map { $r->fetchrow() } (1..$r->ntuples());
+  my $s = $dope->{__DBHandle}->prepare("select * from $table where oid=0"); $s->execute();
+  return undef unless grep { $_ eq $field } @{$s->{NAME}};
+  $s = $dope->{__DBHandle}->prepare("select oid,$field from $table"); $s->execute(); 
+  return undef unless my $n = $s->rows(); map { $s->fetchrow_array() } (1..$n);
 }
 
 sub dumper {
@@ -82,21 +81,20 @@ sub commit {
   $dumper = "'$dumper'"; my $indent = $dump[1]; 
   $indent =~ s/\S.*\n//; $indent = (length $indent)+2;
 
-  $r = $dope->{__DBHandle}->exec("select * from $table where oid=$oid");
-  my @fields = map { $r->fname($_) } (0..$r->nfields()-1);
-
+  $s = $dope->{__DBHandle}->prepare("select * from $table where oid=$oid");
+  $s->execute(); my @fields = @{$s->{NAME}};
   unless (grep { $_ eq '__dump' } @fields) {
-    my $s = $dope->{__DBHandle}->exec
+    my $s = $dope->{__DBHandle}->prepare
       ("alter table $table add column __dump text");
-    return undef unless $s->resultStatus == PGRES_COMMAND_OK;
+    $s->execute(); return undef unless $s->rows();
   }
     
   foreach $key (keys %{$dope->{Template}}) {
     unless (grep { $_ eq $dope->{Template}->{$key} } @fields) {
       if ($dope->{Createfields}) {
-	my $s = $dope->{__DBHandle}->exec
+	my $s = $dope->{__DBHandle}->prepare
 	  ("alter table $table add column $dope->{Template}->{$key} text");
-	return undef unless $s->resultStatus == PGRES_COMMAND_OK;
+	$s->execute(); return undef unless $s->rows();
       }
       else {
 	next;
@@ -112,10 +110,10 @@ sub commit {
     $tablecols{$dope->{Template}->{$key}} = $stringified;
   }
 
-  $r = $dope->{__DBHandle}->exec("select * from $table where oid=$oid");
-  @fields = map { $r->fname($_) } (0..$r->nfields()-1);
+  $s = $dope->{__DBHandle}->prepare("select * from $table where oid=$oid");
+  $s->execute(); my @fields = @{$s->{NAME}};
   
-  if ($r->ntuples and $oid!=0) {
+  if ($n and $oid!=0) {
     $query = "update $table set " . 
              join (',', (map { "$_=$tablecols{$_}" } keys %tablecols),
 		   "__dump=$dumper" ) . " where oid=$oid";
@@ -128,21 +126,22 @@ sub commit {
     }
     $query = "insert into $table values (" . join (',',@insert) . ')';
   }
-
+  
   $query =~ s/(?<=[,(]),/'',/sg; $query =~ s/,(?=\))/,''/sg;
-  $r = $dope->{__DBHandle}->exec($query);
-  return undef unless $r->resultStatus == PGRES_COMMAND_OK;
+  $s = $dope->{__DBHandle}->prepare($query);
+  $s->execute(); return undef unless $s->rows();
   $self->{__Dope} = $dope; 
-  $self->{__Oid} = $oid || $r->oidStatus;
+  $self->{__Oid} = $oid || $s->{pg_oid_status};
 }
 
 sub expire { 
   my ($self, %args) = @_; return undef unless ref $self;
   return undef unless my $oid = $self->{__Oid} and my $dope = $self->{__Dope};
   return undef unless my $table = $dope->{Table};
-  my $r = $dope->{__DBHandle}->exec("select oid from $table where oid=$oid");
-  return undef unless $r->ntuples();
-  $dope->{__DBHandle}->exec("delete from $table where oid=$oid");
+  my $s = $dope->{__DBHandle}->prepare("select oid from $table where oid=$oid");
+  $s->execute(); return undef unless $s->rows();
+  $s = $dope->{__DBHandle}->prepare("delete from $table where oid=$oid");
+  $s->execute();
 } 
 
 sub AUTOLOAD {

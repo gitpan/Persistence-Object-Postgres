@@ -1,22 +1,24 @@
 # -*-cperl-*-
 #
 # Persistence::Object::Postgres - Object Persistence with PostgreSQL.
-# Copyright (c) 2000 Ashish Gulhati <hash@netropolis.org>
+# Copyright (C) 2000-2001, Ashish Gulhati <hash@netropolis.org>
 #
 # All rights reserved. This code is free software; you can
 # redistribute it and/or modify it under the same terms as Perl
 # itself.
 #
-# $Id: Postgres.pm,v 1.22 2000/10/01 03:38:27 cvs Exp $
+# $Id: Postgres.pm,v 1.24 2001/07/07 00:37:13 cvs Exp $
 
 package Persistence::Object::Postgres;
 
 use DBI;
 use Carp;
+use IO::Wrap;
+use IO::Handle;
 use Data::Dumper;
 use vars qw( $VERSION );
 
-( $VERSION ) = '$Revision: 1.22 $' =~ /\s+([\d\.]+)/;
+( $VERSION ) = '$Revision: 1.24 $' =~ /\s+([\d\.]+)/;
 
 sub dbconnect {
   my ($class, $dbobj) = @_;
@@ -42,27 +44,131 @@ sub new {
   bless $self, $class;
 }
 
+package Tie::PgBLOB;
+
+sub IO::Handle::open {
+  shift;
+}
+
+sub TIEHANDLE { 
+  bless {
+	 dbh   => $_[1], 
+	 blob  => $_[2] 
+	}, shift;
+}
+
+sub WRITE {
+  my $r = shift;
+  my ($buf, $len, $offset) = @_;
+  $buf = substr ($buf, $offset, $len);
+  my $nbytes = $r->{dbh}->func($r->{blob}, $buf, length ($buf), 'lo_write');    
+}
+
+sub PRINT { 
+  my $r = shift; 
+  my $buf = join($,,@_,$\); my $nbytes;
+  $r->{dbh}->{AutoCommit} = 0;
+  $r->{dbh}->{RaiseError} = 1;
+  eval {
+    my $blob = $r->{dbh}->func($r->{blob}, $r->{dbh}->{pg_INV_WRITE}, 'lo_open');
+    $r->{dbh}->func($blob, $r->{loc}, 0, 'lo_lseek');
+    $nbytes = $r->{dbh}->func($blob, $buf, length ($buf), 'lo_write');
+    $r->{loc} = $r->{dbh}->func($blob, 'lo_tell');
+    $r->{dbh}->func($blob, 'lo_close');
+    $r->{dbh}->commit();
+  };
+  if ($@) {
+    warn "Transaction aborted because $@";
+    $r->{dbh}->rollback();
+  }
+  $r->{dbh}->{AutoCommit} = 1;
+  return $nbytes;
+}
+
+sub PRINTF {
+  my $r = shift; 
+  my $buf = sprintf(@_);
+  my $nbytes = $r->{dbh}->func($r->{blob}, $buf, length ($buf), 'lo_write');
+}
+
+sub READ {
+  my $r = shift; my $nbytes;
+  my(undef,$len,$offset) = @_;
+  $r->{dbh}->{AutoCommit} = 0;
+  $r->{dbh}->{RaiseError} = 1;
+  eval {
+    my $blob = $r->{dbh}->func($r->{blob}, $r->{dbh}->{pg_INV_READ}, 'lo_open');
+    $r->{dbh}->func($blob, $r->{loc}, 0, 'lo_lseek');
+    $nbytes = $r->{dbh}->func($blob, $_[0], $len, 'lo_read');
+    $r->{loc} = $r->{dbh}->func($blob, 'lo_tell');
+    $r->{dbh}->func($blob, 'lo_close');
+    $r->{dbh}->commit();
+  };
+  if ($@) {
+    warn "Transaction aborted because $@";
+    $r->{dbh}->rollback();
+    $r->{dbh}->{AutoCommit} = 1;
+    return;
+  }
+  $r->{dbh}->{AutoCommit} = 1;
+  return $nbytes;
+}
+
+sub READLINE { 
+  my $r = shift; my $buf; my $l; my $fix; my $nbytes;
+  while ($nbytes = $r->{dbh}->func($r->{blob}, $buf, 1024, 'lo_read')) {
+    $buf = $fix . $buf;
+    if (my $x = index($buf,$\)) { # bug: need to handle $\ = '' case.
+      $l .= substr($buf, 0, $x+length($\));
+      # rewind stream
+      last;
+    }
+    $l .= substr($buf,0,-(length($\))); 
+    $fix = substr($buf,-(length($\)));
+  }
+  return $l;
+}
+    
+sub GETC { 
+  print "Don't GETC, Get Perl"; return "a"; 
+}
+      
+sub CLOSE { 
+  my $r = shift;
+  $r->{dbh}->func($r->{blob}, 'lo_close');
+}
+	
+sub DESTROY { 
+  my $r = shift;
+  $r->{dbh}->func($r->{blob}, 'lo_close');
+}
+
+package Persistence::Object::Postgres;
+
 sub load { 
   my ( $class, %args ) = @_; 
   return undef unless my $oid = $args{__Oid} and my $dope = $args{__Dope}; 
   return undef unless my $table = $dope->{Table}; 
   my @keys = keys %{$dope->{Template}};
-  my $selfields = join ',', '__dump', map { $dope->{Template}->{$_} } @keys;
+  my $selfields = join ',', '"__dump"', map { "\"$_\"" } @keys; 
   my $s = $dope->{__DBHandle}->prepare("select $selfields from $table where oid=$oid");
   $s->execute(); return undef unless $s->rows(); my @row = $s->fetchrow_array();
   $object = eval $row[0]; $object->{__Dope} = $dope; $object->{__Oid} = $oid;
-  my $i = 0; foreach (@keys) { $object->{$_} = $object->{$_} eq 'ref'?eval $row[++$i]:$row[++$i] }
+  my $i = 0; 
+  foreach (@keys) { 
+    if ($object->{$_} eq 'ref') {
+      $object->{$_} = eval $row[++$i];
+    }
+    elsif ($object->{$_} eq 'blob') {
+      my $x = IO::Handle->new();
+      tie($$x, 'Tie::PgBLOB', $dope->{__DBHandle}, $row[++$i]);
+      $object->{$_} = $x;
+    }
+    else {
+      $object->{$_} = $row[++$i];
+    }
+  }
   return $object; 
-}
-
-sub values {
-  my ($class, %args) = @_;
-  return undef unless my $key = $args{Key} and my $dope = $args{__Dope};
-  return undef unless my $table = $dope->{Table} and my $field = $dope->{Template}->{$key};
-  my $s = $dope->{__DBHandle}->prepare("select * from $table where oid=0"); $s->execute();
-  return undef unless grep { $_ eq $field } @{$s->{NAME}};
-  $s = $dope->{__DBHandle}->prepare("select oid,$field from $table"); $s->execute(); 
-  return undef unless my $n = $s->rows(); map { $s->fetchrow_array() } (1..$n);
 }
 
 sub commit {
@@ -76,16 +182,16 @@ sub commit {
   $s->execute(); my @fields = @{$s->{NAME}};
   unless (grep { $_ eq '__dump' } @fields) {
     my $s = $dope->{__DBHandle}->prepare
-      ("alter table $table add column __dump text");
+      ("alter table $table add column \"__dump\" text");
     $s->execute(); return undef unless $s->rows();
   }
   
   my %dd = %$self; $Data::Dumper::Indent = 0; 
   foreach $key (keys %{$dope->{Template}}) {
-    unless (grep { $_ eq $dope->{Template}->{$key} } @fields) {
+    unless (grep { $_ eq $key } @fields) {
       if ($dope->{Createfields}) {
 	my $s = $dope->{__DBHandle}->prepare
-	  ("alter table $table add column $dope->{Template}->{$key} text");
+	  ("alter table $table add column \"$key\" \"$dope->{Template}->{$key}\"");
 	$s->execute(); return undef unless $s->rows();
       }
       else {
@@ -101,8 +207,32 @@ sub commit {
       $stringified =~ s/(?<=[^\\])\'/\\\'/sg; $stringified =~ s/^'/\\'/s;
       $stringified =~ s/^(\\\')?/\'/s; $stringified =~ s/(\\\')?$/\'/s; 
     }
-    $tablecols{$dope->{Template}->{$key}} = $stringified;
-    if (ref $dd{$key}) { $dd{$key} = 'ref' } else { delete $dd{$key} };
+    if (my $t = ref $dd{$key}) { 
+      if ($t =~ /^(GLOB|IO::(Handle|File|Wrap)|FileHandle)/) {
+	if (ref (my $b = tied $$dd{$key}) eq 'Tie::PgBLOB') {
+	  $tablecols{$key} = $b->{blob};
+	}
+	else {
+	  my $x = wraphandle(IO::Handle->new());
+	  my $y = wraphandle($dd{$key});
+	  my $newblob = $dope->dbhandle->func($dope->dbhandle->{pg_INV_WRITE}, 
+					      'lo_creat');
+	  tie($$x, 'Tie::PgBLOB', $dope->dbhandle, $newblob); 
+	  my $buffer; print $x $buffer while $y->read($buffer, 128);
+	  $x->close();
+	  $tablecols{$key} = $newblob;
+	}
+	$dd{$key} = 'blob';
+      }
+      else {
+	$dd{$key} = 'ref';
+	$tablecols{$key} = $stringified;
+      }
+    } 
+    else { 
+      delete $dd{$key};
+      $tablecols{$key} = $stringified;
+    }
   }
 
   $Data::Dumper::Indent = 1;
@@ -111,11 +241,11 @@ sub commit {
   $dumper =~ s/\'/\\\'/sg; $dumper = "'$dumper'"; 
 
   $s = $dope->{__DBHandle}->prepare("select * from $table where oid=$oid");
-  my $n = $s->execute(); my @fields = @{$s->{NAME}};
+  my $n = $s->execute(); @fields = @{$s->{NAME}};
   
   if ($n and $oid!=0) {
     $query = "update $table set " . 
-             join (',', (map { "$_=$tablecols{$_}" } keys %tablecols),
+             join (',', (map { "\"$_\"=$tablecols{$_}" } keys %tablecols),
 		   "__dump=$dumper" ) . " where oid=$oid";
   }
   else {
@@ -144,6 +274,23 @@ sub expire {
   $s = $dope->{__DBHandle}->prepare("delete from $table where oid=$oid");
   $s->execute();
 } 
+
+sub select {
+  my ($class, $dope, $where) = @_;
+  return undef unless $dope;
+  return undef unless my $table = $dope->{Table};
+  my $s = $dope->{__DBHandle}->prepare("select oid from $table $where"); $s->execute(); 
+  return undef unless my $n = $s->rows(); 
+  map { $s->fetchrow_array() } (1..$n);
+}
+
+sub lock {
+  1;
+}
+
+sub unlock {
+  1;
+}
 
 sub AUTOLOAD {
   my ($self, $val) = @_; (my $auto = $AUTOLOAD) =~ s/.*:://;
@@ -190,15 +337,16 @@ Persistence::Object::Postgres - Object Persistence with PostgreSQL.
 
 =head1 DESCRIPTION
 
-This module provides persistence facilities to its objects. Object
-definitions are stored in a PostgreSQL database as stringified perl
-data structures, generated with Data::Dumper. Persistence is achieved
-with a blessed hash container that holds the object data.
+This module provides persistence (and optionally, replication)
+facilities to its objects. Object definitions are stored in a
+PostgreSQL database as stringified perl data structures, generated
+with Data::Dumper. Persistence is achieved with a blessed hash
+container that holds the object data.
 
-Using a template mapping object properties to PostgreSQL class fields,
-it is possible to automatically generate PostgreSQL fields out of the
-object data, which allows you to use poweful PostgreSQL indexing and
-querying facilities on your database of persistent objects.
+Using a template mapping object data to PostgreSQL fields, it is
+possible to automatically generate PostgreSQL fields out of the object
+data, which allows you to use poweful PostgreSQL indexing and querying
+facilities on your database of persistent objects.
 
 This module is intended for use in conjunction with the object
 database class Persistence::Database::SQL, which provides persistent
@@ -294,27 +442,25 @@ should still work fine. __Oid just won't be ignored, is all.
 Persistence::Database::SQL(3), 
 Data::Dumper(3), 
 Persistence::Object::Simple(3), 
+DBD::Recall(3),
+Replication::Recall::DBServer(3),
 perlobj(1), perlbot(1), perltoot(1).
 
 =head1 AUTHOR
 
-Persistence::Object::Postgres is Copyright (c) 2000 Ashish Gulhati
-<hash@netropolis.org>. All Rights Reserved.
+Persistence::Object::Postgres is Copyright (c) 2000-2001, Ashish
+Gulhati <hash@netropolis.org>. All Rights Reserved.
 
 =head1 ACKNOWLEDGEMENTS
 
-Thanks to Barkha for inspiration, laughs and all 'round good times; to
-Vipul for Persistence::Object::Simple, the constant use and abuse of
-which resulted in the writing of this module; and of-course, to Larry
-Wall, Richard Stallman, and Linus Torvalds.
+Thanks to Barkha for inspiration, laughs and great times, and to Vipul
+for Persistence::Object::Simple, the constant use and abuse of which
+resulted in the writing of this module.
 
 =head1 LICENSE
 
 This code is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
-
-It would be nice if you would mail your patches to me, and I would
-love to hear about projects that make use of this module.
 
 =head1 DISCLAIMER
 
